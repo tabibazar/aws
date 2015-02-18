@@ -1,0 +1,204 @@
+{
+	"AWSTemplateFormatVersion" : "2010-09-09",
+
+	"Description" : "NGINX Proxy for EC2 Classic ELB to new destination address",
+
+	"Parameters" : {
+
+		"Environment" : {
+			"Description" : "Environment, preferably unique. No spaces allowed.",
+			"Type" : "String",
+			"AllowedPattern" : "[a-zA-Z][-_a-zA-Z0-9]*"
+		},
+
+		"KeyName" : {
+			"Description" : "The EC2 Key Pair to allow SSH access to the instances.",
+			"Type" : "AWS::EC2::KeyPair::KeyName"
+		},
+
+		"UbuntuAmi" : {
+			"Description" : "Ubuntu Amazon Machine Image (AMI).",
+			"Type" : "String",
+			"AllowedPattern" : "ami-[0-9a-f]{8}"
+		},
+
+		"NginxProxyInstanceType" : {
+			"Description" : "EC2 instance type",
+			"Type" : "String",
+			"ConstraintDescription" : "Must be a valid EC2 instance type."
+		},
+
+		"NginxProxyInstanceCountMin" : {
+			"Description" : "Min number of instances in auto scaling group.",
+			"Type" : "String"
+		},
+
+		"NginxProxyInstanceCountMax" : {
+			"Description" : "Max number of instances in auto scaling group.",
+			"Type" : "String"
+		},
+
+		"NginxProxyAvailabilityZones" : {
+			"Description" : "Availability zones for the instances.",
+			"Type" : "CommaDelimitedList"
+		},
+
+		"SourceEc2ClassicElbId" : {
+			"Description" : "EC2 Classic ELB IDs.",
+			"Type" : "String",
+			"Type" : "CommaDelimitedList"
+		},
+
+		"DestinationAddress" : {
+			"Description" : "Target address. Do not include http:// or https:// in the address.",
+			"Type" : "String"
+		}
+
+	},
+
+	"Resources" : {
+
+		"NginxProxySecurityGroup" : {
+			"Type" : "AWS::EC2::SecurityGroup",
+			"Properties" : {
+				"GroupDescription" : "NGINX proxy security group.",
+				"SecurityGroupIngress" : [{
+					"IpProtocol" : "tcp",
+					"FromPort" : "80",
+					"ToPort" : "80",
+					"CidrIp" : "0.0.0.0/0"
+				},{
+					"IpProtocol" : "tcp",
+					"FromPort" : "443",
+					"ToPort" : "443",
+					"CidrIp" : "0.0.0.0/0"
+				}]
+			}
+		},
+
+		"NginxProxyWaitHandle" : {
+			"Type" : "AWS::CloudFormation::WaitConditionHandle"
+		},
+
+		"NginxProxyLaunchConfiguration": {
+			"Type": "AWS::AutoScaling::LaunchConfiguration",
+			"Metadata" : {
+				"AWS::CloudFormation::Init" : {
+					"config" : {
+						"packages" : {
+							"apt" : {
+								"nginx" : []
+							}
+						},
+						"files" : {
+							"/etc/nginx/nginx.conf" : {
+								"content" : { "Fn::Join" : ["", [
+									"user www-data;\n",
+									"worker_processes 4;\n",
+									"pid /run/nginx.pid;\n",
+									"\n",
+									"events {\n",
+									"  worker_connections 768;\n",
+									"}\n",
+									"\n",
+									"http {\n",
+									"  sendfile on;\n",
+									"  tcp_nopush on;\n",
+									"  tcp_nodelay on;\n",
+									"  keepalive_timeout 65;\n",
+									"  types_hash_max_size 2048;\n",
+									"  include /etc/nginx/mime.types;\n",
+									"  default_type application/octet-stream;\n",
+									"  access_log /var/log/nginx/access.log;\n",
+									"  error_log /var/log/nginx/error.log;\n",
+									"  gzip on;\n",
+									"  gzip_disable \"msie6\";\n",
+									"  \n",
+									"  server {\n",
+									"    listen       80;\n",
+									"    \n",
+									"    location / {\n",
+									"      proxy_pass http://", { "Ref" : "DestinationAddress" }, "/;\n",
+									"    }\n",
+									"  }\n",
+									"\n",
+									"  server {\n",
+									"    listen       443 ssl;\n",
+									"    \n",
+									"    location / {\n",
+									"      proxy_pass http://www.google.com/;\n",
+									"    }\n",
+									"  }\n",
+									"}\n",
+									"\n"
+									]]},
+								"mode"   : "000644",
+								"owner"  : "root",
+								"group"  : "root"
+							}
+						},
+
+						"services" : {
+							"sysvinit" : {
+								"nginx" : {
+									"enabled" : "true",
+									"ensureRunning" : "true",
+									"files" : ["/etc/nginx/nginx.conf"],
+									"sources" : ["/var/www/html"]
+								}
+							}
+						}
+					}
+				}
+			},
+			"Properties": {
+				"ImageId": { "Ref" : "UbuntuAmi" },
+				"InstanceType": { "Ref": "NginxProxyInstanceType" },
+				"KeyName": { "Ref": "KeyName" },
+				"InstanceMonitoring": "false",
+				"SecurityGroups": [ { "Ref": "NginxProxySecurityGroup" }],
+				"UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+					"#!/bin/bash -v\n",
+					"echo \"127.0.0.1 `hostname`\" >> /etc/hosts\n",
+					"# Helper function\n",
+					"function error_exit\n",
+					"{\n",
+					"  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "NginxProxyWaitHandle" }, "'\n",
+					"  exit 1\n",
+					"}\n",
+
+					"# Do a couple updates\n",
+					"apt-get update\n",
+					"apt-get install -y python-pip\n",
+					"pip install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz\n",
+					"pip install awscli\n",
+
+					"cfn-init --region ",{ "Ref" : "AWS::Region" }, " -s ", { "Ref" : "AWS::StackId" }, " -r NginxProxyLaunchConfiguration || error_exit 'Failed to run cfn-init'\n",
+
+					"# All is well so signal success\n",
+					"cfn-signal -e 0 -r \"NGINX proxy setup complete\" '", { "Ref" : "NginxProxyWaitHandle" }, "'\n",
+					"\n"
+				]]}}
+			}
+		},
+
+		"NginxProxyScalingGroup": {
+			"Type": "AWS::AutoScaling::AutoScalingGroup",
+			"Version": "2009-05-15",
+			"Properties": {
+				"AvailabilityZones": { "Ref" : "NginxProxyAvailabilityZones" },
+				"LaunchConfigurationName": { "Ref": "NginxProxyLaunchConfiguration" },
+				"LoadBalancerNames" : { "Ref": "SourceEc2ClassicElbId" },
+				"MinSize": { "Ref" : "NginxProxyInstanceCountMin" },
+				"MaxSize": { "Ref" : "NginxProxyInstanceCountMax" },
+				"Tags": [
+					{ "Key" : "Name", "Value" : { "Fn::Join" : ["", ["NginxProxy-", { "Ref" : "Environment" } ]]}, "PropagateAtLaunch" : "true" },
+					{ "Key" : "environment", "Value" : { "Ref": "Environment" },                                   "PropagateAtLaunch" : "true" },
+					{ "Key" : "role",        "Value" : "proxy",                                                    "PropagateAtLaunch" : "true" }
+				]
+			}
+		}
+
+	}
+
+}
